@@ -22,9 +22,9 @@ function ReplaceFilter(inputTree, _options) {
 
 inherits(ReplaceFilter, Filter);
 
-ReplaceFilter.prototype.getDestFilePath = function(relativePath) {
+ReplaceFilter.prototype.getDestFilePath = function(relativePath, entry) {
   if (this._glob === undefined) {
-    return Filter.prototype.getDestFilePath.call(this, relativePath);
+    return Filter.prototype.getDestFilePath.call(this, relativePath, entry);
   }
   return minimatch(relativePath, this._glob) ? relativePath : null;
 };

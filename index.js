@@ -1,22 +1,16 @@
 'use strict';
 
-var fs = require('fs');
 var path = require('path');
-var mkdirp = require('mkdirp');
 var Promise = require('rsvp').Promise;
 var Plugin = require('broccoli-plugin');
-var walkSync = require('walk-sync');
 var mapSeries = require('promise-map-series');
-var symlinkOrCopySync = require('symlink-or-copy').sync;
 var debugGenerator = require('heimdalljs-logger');
-var md5Hex = require('md5-hex');
+var md5Hex = require('./lib/md5-hex');
 var Processor = require('./lib/processor');
 var defaultProccessor = require('./lib/strategies/default');
 var hashForDep = require('hash-for-dep');
-var BlankObject = require('blank-object');
-var FSTree = require('fs-tree-diff');
 var heimdall = require('heimdalljs');
-
+var queue = require('async-promise-queue');
 
 function ApplyPatchesSchema() {
   this.mkdir = 0;
@@ -29,6 +23,7 @@ function ApplyPatchesSchema() {
   this.linked = 0;
 
   this.processString = 0;
+  this.processStringTime = 0;
   this.persistentCacheHit = 0;
   this.persistentCachePrime = 0;
 }
@@ -37,6 +32,8 @@ function DerivePatchesSchema() {
   this.patches = 0;
   this.entries = 0;
 }
+
+var worker = queue.async.asyncify(function(doWork) { return doWork(); });
 
 module.exports = Filter;
 
@@ -49,20 +46,24 @@ function Filter(inputTree, options) {
     throw new TypeError('Filter is an abstract class and must be sub-classed');
   }
 
-  var name = 'broccoli-persistent-filter:' + (this.constructor.name);
+  var loggerName = 'broccoli-persistent-filter:' + (this.constructor.name);
+  var annotation = (options && options.annotation) || this.annotation || this.description;
 
-  if (this.description) {
-    name += ' > [' + this.description + ']';
+  if (annotation) {
+    loggerName += ' > [' + annotation + ']';
   }
 
-  this._logger = debugGenerator(name);
+  this._logger = debugGenerator(loggerName);
 
-  Plugin.call(this, [inputTree]);
+  Plugin.call(this, [inputTree], {
+    name: (options && options.name) || this.name || loggerName,
+    annotation: (options && options.annotation) || this.annotation || annotation,
+    fsFacade: true,
+    persistentOutput: true
+  });
 
   this.processor = new Processor(options);
   this.processor.setStrategy(defaultProccessor);
-  this.currentTree = new FSTree();
-  this._persistentOutput = true;
 
   /* Destructuring assignment in node 0.12.2 would be really handy for this! */
   if (options) {
@@ -73,78 +74,124 @@ function Filter(inputTree, options) {
     if (options.persist) {
       this.processor.setStrategy(require('./lib/strategies/persistent'));
     }
+    this.async = (options.async === true);
   }
 
   this.processor.init(this);
 
-  this._canProcessCache = new BlankObject();
-  this._destFilePathCache = new BlankObject();
+  this._canProcessCache = Object.create(null);
+  this._destFilePathCache = Object.create(null);
+  this._needsReset = false;
+
+  this.concurrency = (options && options.concurrency) || Number(process.env.JOBS) || Math.max(require('os').cpus().length - 1, 1);
+}
+
+function nanosecondsSince(time) {
+  var delta = process.hrtime(time);
+  return delta[0] * 1e9 + delta[1];
+}
+
+function timeSince(time) {
+  var deltaNS = nanosecondsSince(time);
+  return (deltaNS / 1e6).toFixed(2) +' ms';
 }
 
 Filter.prototype.build = function() {
-  var srcDir = this.inputPaths[0];
-  var destDir = this.outputPath;
+  //TODO: Should remove this when Builder is fixed.
+  if (this._needsReset) {
+    this.out.emptySync('');
+  }
+
+  this._needsReset = true;
 
   var instrumentation = heimdall.start('derivePatches', DerivePatchesSchema);
+  const patches = this.in[0].changes();
 
-  var entries = walkSync.entries(srcDir);
-  var nextTree = new FSTree.fromEntries(entries);
-  var currentTree = this.currentTree;
-
-  this.currentTree = nextTree;
-
-  var patches = currentTree.calculatePatch(nextTree);
+  console.log(`----------------patches from ${this._name + (this._annotation != null ? ' (' + this._annotation + ')' : '')}`);
+  patches.forEach(patch => {
+    console.log(patch[0] + ' ' + patch[1].replace(/(\/|\\)$/, ''));
+  });
 
   instrumentation.stats.patches = patches.length;
-  instrumentation.stats.entries = entries.length;
-
+  instrumentation.stats.entries = this.in[0].entries.length;
   instrumentation.stop();
+  var plugin = this;
 
-  return heimdall.node('applyPatches', ApplyPatchesSchema, function(instrumentation) {
-    return mapSeries(patches, function(patch) {
-      var operation = patch[0];
-      var relativePath = patch[1];
-      var entry = patch[2];
-      var outputPath = destDir + '/' + (this.getDestFilePath(relativePath) || relativePath);
-      var outputFilePath = outputPath;
+  // used with options.async = true to allow 'create' and 'change' operations to complete async
+  var pendingWork = [];
 
-      this._logger.debug('[operation:%s] %s', operation, relativePath);
+  return new Promise(function(resolve) {
+    resolve(heimdall.node('applyPatches', ApplyPatchesSchema, function(instrumentation) {
+      var prevTime = process.hrtime();
+      return new Promise(function(resolve) {
+        var result = mapSeries(patches, function(patch) {
+          var operation = patch[0];
+          var relativePath = patch[1];
+          var entry = patch[2];
 
-      switch (operation) {
-        case 'mkdir': {
-          instrumentation.mkdir++;
-          return fs.mkdirSync(outputPath);
-        } case 'rmdir': {
-          instrumentation.rmdir++;
-          return fs.rmdirSync(outputPath);
-        } case 'unlink': {
-          instrumentation.unlink++;
-          return fs.unlinkSync(outputPath);
-        } case 'change': {
-          instrumentation.change++;
-          return this._handleFile(relativePath, srcDir, destDir, entry, outputFilePath, true, instrumentation);
-        } case 'create': {
-          instrumentation.create++;
-          return this._handleFile(relativePath, srcDir, destDir, entry, outputFilePath, false, instrumentation);
-        } default: {
-          instrumentation.other++;
-        }
-      }
-    }, this);
-  }, this);
+          plugin._logger.debug('[operation:%s] %s', operation, relativePath);
+
+          switch (operation) {
+            case 'mkdir': {
+              instrumentation.mkdir++;
+              return plugin.out.mkdirSync(relativePath);
+            } case 'rmdir': {
+              instrumentation.rmdir++;
+              return plugin.out.rmdirSync(relativePath);
+            } case 'unlink': {
+              instrumentation.unlink++;
+              return plugin.out.unlinkSync(plugin.getDestFilePath(entry) || relativePath);
+            } case 'change': {
+              // wrap this in a function so it doesn't actually run yet, and can be throttled
+              var changeOperation = function() {
+                instrumentation.change++;
+                return plugin._handleFile(entry, true, instrumentation);
+              };
+              if (plugin.async) {
+                pendingWork.push(changeOperation);
+                return;
+              }
+              return changeOperation();
+            } case 'create': {
+              // wrap this in a function so it doesn't actually run yet, and can be throttled
+              var createOperation = function() {
+                instrumentation.create++;
+                return plugin._handleFile(entry, false, instrumentation);
+              };
+              if (plugin.async) {
+                pendingWork.push(createOperation);
+                return;
+              }
+              return createOperation();
+            } default: {
+              instrumentation.other++;
+            }
+          }
+        });
+        resolve(result);
+      }).then(function() {
+        return queue(worker, pendingWork, plugin.concurrency);
+      }).then(function(result) {
+        plugin._logger.info('applyPatches', 'duration:', timeSince(prevTime), JSON.stringify(instrumentation));
+        plugin._needsReset = false;
+        return result;
+      });
+    }));
+  });
 };
 
-Filter.prototype._handleFile = function(relativePath, srcDir, destDir, entry, outputPath, isChange, instrumentation) {
-  if (this.canProcessFile(relativePath)) {
+Filter.prototype._handleFile = function(entry, isChange, instrumentation) {
+  const relativePath = entry.relativePath;
+
+  if (this.canProcessFile(relativePath, entry)) {
     instrumentation.processed++;
-    return this.processAndCacheFile(srcDir, destDir, entry, isChange, instrumentation);
+    return this.processAndCacheFile(this.in[0].root, this.out.root, entry, isChange, instrumentation);
   } else {
     instrumentation.linked++;
     if (isChange) {
-      fs.unlinkSync(outputPath);
+        this.out.unlinkSync(relativePath);
     }
-    var srcPath = srcDir + '/' + relativePath;
-    return symlinkOrCopySync(srcPath, outputPath);
+    return this.out.symlinkToFacadeSync(this.in[0], relativePath, relativePath);
   }
 };
 
@@ -183,12 +230,23 @@ Filter.prototype.cacheKeyProcessString = function(string, relativePath) {
   return md5Hex(string + 0x00 + relativePath);
 };
 
+// TODO: Remove `relativePath` argument (API change).
 Filter.prototype.canProcessFile =
-    function canProcessFile(relativePath) {
-  return !!this.getDestFilePath(relativePath);
+    function canProcessFile(relativePath, entry) {
+  return !!this.getDestFilePath(relativePath, entry);
 };
 
-Filter.prototype.getDestFilePath = function(relativePath) {
+Filter.prototype.isDirectory = function(relativePath, entry) {
+  return (entry || this.in[0].statSync(relativePath)).isDirectory();
+};
+
+  // TODO: Remove `relativePath` argument (API change).
+Filter.prototype.getDestFilePath = function(relativePath, entry) {
+  // NOTE: relativePath may have been moved or unlinked
+  if (this.isDirectory(relativePath, entry)) {
+    return null;
+  }
+
   if (this.extensions == null) {
     return relativePath;
   }
@@ -206,13 +264,14 @@ Filter.prototype.getDestFilePath = function(relativePath) {
   return null;
 };
 
+// TODO: Remove `srcDir` and `destDir` arguments (API change).
 Filter.prototype.processAndCacheFile = function(srcDir, destDir, entry, isChange, instrumentation) {
   var filter = this;
   var relativePath = entry.relativePath;
 
   return Promise.resolve().
       then(function asyncProcessFile() {
-        return filter.processFile(srcDir, destDir, relativePath, isChange, instrumentation);
+        return filter.processFile(srcDir, destDir, isChange, instrumentation, entry);
       }).
       then(undefined,
       // TODO(@caitp): error wrapper is for API compat, but is not particularly
@@ -221,7 +280,7 @@ Filter.prototype.processAndCacheFile = function(srcDir, destDir, entry, isChange
       function asyncProcessFileErrorWrapper(e) {
         if (typeof e !== 'object') e = new Error('' + e);
         e.file = relativePath;
-        e.treeDir = srcDir;
+        e.treeDir = filter.in[0].root;
         throw e;
       });
 };
@@ -232,23 +291,27 @@ function invoke(context, fn, args) {
   });
 }
 
-Filter.prototype.processFile = function(srcDir, destDir, relativePath, isChange, instrumentation) {
+// TODO: Remove `srcDir` and `destDir` arguments (API change).
+Filter.prototype.processFile = function(srcDir, destDir, isChange, instrumentation, entry) {
   var filter = this;
   var inputEncoding = this.inputEncoding;
   var outputEncoding = this.outputEncoding;
+  const relativePath = entry.relativePath;
 
   if (inputEncoding === undefined)  inputEncoding  = 'utf8';
   if (outputEncoding === undefined) outputEncoding = 'utf8';
 
-  var contents = fs.readFileSync(srcDir + '/' + relativePath, {
+  var contents = this.in[0].readFileSync(relativePath, {
     encoding: inputEncoding
   });
 
   instrumentation.processString++;
+  var processStringStart = process.hrtime();
   var string = invoke(this.processor, this.processor.processString, [this, contents, relativePath, instrumentation]);
 
   return string.then(function asyncOutputFilteredFile(outputString) {
-    var outputPath = filter.getDestFilePath(relativePath);
+    instrumentation.processStringTime += nanosecondsSince(processStringStart);
+    var outputPath = filter.getDestFilePath(relativePath, entry);
 
     if (outputPath == null) {
       throw new Error('canProcessFile("' + relativePath +
@@ -256,10 +319,11 @@ Filter.prototype.processFile = function(srcDir, destDir, relativePath, isChange,
                       relativePath + '") is null');
     }
 
-    outputPath = destDir + '/' + outputPath;
-
+    // TODO: Is this check still necessary?  WritableTree will skip writing to
+    // an existing file if the contents are the same… and do so without reading
+    // from disk.
     if (isChange) {
-      var isSame = fs.readFileSync(outputPath, 'UTF-8') === outputString;
+      var isSame = this.out.readFileSync(outputPath, 'UTF-8') === outputString;
       if (isSame) {
 
         this._logger.debug('[change:%s] but was the same, skipping', relativePath, isSame);
@@ -269,15 +333,17 @@ Filter.prototype.processFile = function(srcDir, destDir, relativePath, isChange,
       }
     }
 
+    // TODO: Is this try/catch still necessary?  WritableTree can mkdirpSync an
+    // existing directory without causing I/O.
     try {
-      fs.writeFileSync(outputPath, outputString, {
+      this.out.writeFileSync(outputPath, outputString, {
         encoding: outputEncoding
       });
 
     } catch(e) {
       // optimistically assume the DIR was patched correctly
-      mkdirp.sync(path.dirname(outputPath));
-      fs.writeFileSync(outputPath, outputString, {
+      this.out.mkdirpSync(path.dirname(outputPath));
+      this.out.writeFileSync(outputPath, outputString, {
         encoding: outputEncoding
       });
     }
