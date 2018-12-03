@@ -107,11 +107,6 @@ Filter.prototype.build = function() {
   var instrumentation = heimdall.start('derivePatches', DerivePatchesSchema);
   const patches = this.in[0].changes();
 
-  console.log(`----------------patches from ${this._name + (this._annotation != null ? ' (' + this._annotation + ')' : '')}`);
-  patches.forEach(patch => {
-    console.log(patch[0] + ' ' + patch[1].replace(/(\/|\\)$/, ''));
-  });
-
   instrumentation.stats.patches = patches.length;
   instrumentation.stats.entries = this.in[0].entries.length;
   instrumentation.stop();
